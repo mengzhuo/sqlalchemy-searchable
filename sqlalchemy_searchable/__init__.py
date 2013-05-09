@@ -112,9 +112,9 @@ event.listen(Mapper, 'instrument_class', attach_search_indexes)
 DEFAULT_SEARCH_OPTIONS = {
     'tablename': None,
     'search_vector_name': 'search_vector',
-    'search_trigger_name': '{table}_search_update',
+    'search_trigger_name': '{table}_search_update', # ignore in Mysql
     'search_index_name': '{table}_search_index',
-    'catalog': 'pg_catalog.english'
+    'catalog': 'pg_catalog.english' # ignore in Mysql
 }
 
 
@@ -230,19 +230,19 @@ class Searchable(object):
         event.listen(
             table,
             'after_create',
-            cls._search_vector_ddl()
+            cls._search_vector_ddl().execute_if(dialect='postgresql'),
         )
 
         # This indexes the tsvector column.
         event.listen(
             table,
             'after_create',
-            cls._search_index_ddl()
+            cls._search_index_ddl().execute_if(dialect='postgresql'),
         )
 
         # This sets up the trigger that keeps the tsvector column up to date.
         event.listen(
             table,
             'after_create',
-            cls._search_trigger_ddl()
+            cls._search_trigger_ddl().execute_if(dialect='postgresql'),
         )

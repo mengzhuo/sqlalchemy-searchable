@@ -102,6 +102,7 @@ def quote_identifier(identifier):
 
 def attach_search_indexes(mapper, class_):
     if issubclass(class_, Searchable):
+        class_.__search_args_init__()
         class_.define_search_vector()
 
 
@@ -109,24 +110,23 @@ def attach_search_indexes(mapper, class_):
 event.listen(Mapper, 'instrument_class', attach_search_indexes)
 
 
-DEFAULT_SEARCH_OPTIONS = {
-    'tablename': None,
-    'search_vector_name': 'search_vector',
-    'search_trigger_name': '{table}_search_update', # ignore in Mysql
-    'search_index_name': '{table}_search_index',
-    'catalog': 'pg_catalog.english' # ignore in Mysql
-}
-
-
 class Searchable(object):
+
     __searchable_columns__ = []
 
+    __search_vector_name__ = 'search_vector'   # pg
+    __search_catalog__ = 'pg_catalog.english'  # pg
+    __search_modifier__ = 'IN BOOLEAN MODE'    # mysql
+    
     @classmethod
-    def _get_search_option(cls, name):
-        try:
-            return cls.__search_options__[name]
-        except (AttributeError, KeyError):
-            return DEFAULT_SEARCH_OPTIONS[name]
+    def __search_args_init__(cls):
+        if not hasattr(cls, '__search_trigger_name__'):
+            cls.__search_trigger_name__ = '{.__tablename__}_search_update'.format(cls)
+
+        if not hasattr(cls, '__search_index_name__'):
+            cls.__search_index_name__ = '{.__tablename__}_search_index'.format(cls)
+
+        return cls
 
     @classmethod
     def _inspect_searchable_tablename(cls):
@@ -143,74 +143,41 @@ class Searchable(object):
             return class_._inspect_searchable_tablename()
 
     @classmethod
-    def _search_vector_ddl(cls):
-        """
-        Returns the ddl for the search vector.
-        """
-        tablename = cls.__tablename__
-        search_vector_name = cls._get_search_option('search_vector_name')
+    def __make_ddls(cls):
+        return [
+            # PostgreSQL
+            DDL("""
+                ALTER TABLE {0.__tablename__}
+                ADD COLUMN {0.__search_vector_name__} tsvector
+                """
+                .format(cls)).execute_if(dialect='postgresql'),
 
-        return DDL(
-            """
-            ALTER TABLE {table}
-            ADD COLUMN {search_vector_name} tsvector
-            """
-            .format(
-                table=quote_identifier(tablename),
-                search_vector_name=search_vector_name
-            )
-        )
-
-    @classmethod
-    def _search_index_ddl(cls):
-        """
-        Returns the ddl for creating the actual search index.
-        """
-        tablename = cls.__tablename__
-        search_vector_name = cls._get_search_option('search_vector_name')
-        search_index_name = cls._get_search_option('search_index_name').format(
-            table=tablename
-        )
-        return DDL(
-            """
-            CREATE INDEX {search_index_name} ON {table}
-            USING gin({search_vector_name})
-            """
-            .format(
-                table=quote_identifier(tablename),
-                search_index_name=search_index_name,
-                search_vector_name=search_vector_name
-            )
-        )
-
-    @classmethod
-    def _search_trigger_ddl(cls):
-        """
-        Returns the ddl for creating an automatically updated search trigger.
-        """
-        tablename = cls.__tablename__
-        search_vector_name = cls._get_search_option('search_vector_name')
-        search_trigger_name = cls._get_search_option(
-            'search_trigger_name'
-        ).format(table=tablename)
-
-        return DDL(
-            """
-            CREATE TRIGGER {search_trigger_name}
-            BEFORE UPDATE OR INSERT ON {table}
-            FOR EACH ROW EXECUTE PROCEDURE
-            tsvector_update_trigger({arguments})
-            """
-            .format(
-                search_trigger_name=search_trigger_name,
-                table=quote_identifier(tablename),
-                arguments=', '.join([
-                    search_vector_name,
-                    "'%s'" % cls._get_search_option('catalog')] +
-                    cls.__searchable_columns__
-                )
-            )
-        )
+            DDL("""
+                CREATE INDEX {0.__search_index_name__} 
+                ON {0.__tablename__}
+                USING gin({0.__search_vector_name__})
+                """
+                .format(cls)).execute_if(dialect='postgresql'),
+            DDL("""
+                CREATE TRIGGER {0.__search_trigger_name__}
+                BEFORE UPDATE OR INSERT ON {0.__tablename__}
+                FOR EACH ROW EXECUTE PROCEDURE
+                tsvector_update_trigger({1})
+                """
+                .format(cls,
+                        ', '.join([cls.__search_vector_name__,
+                               "'%s'" % cls.__search_catalog__] + 
+                                      cls.__searchable_columns__ ))
+                ).execute_if(dialect='postgresql'),
+            # MySQL
+            DDL("""
+                ALTER TABLE {0.__tablename__}
+                ADD NEW FULLTEXT({1})
+                """
+                .format(cls,
+                        ", ".join(cls.__searchable_columns__))
+                ).execute_if(dialect='mysql')
+        ]
 
     @classmethod
     def define_search_vector(cls):
@@ -221,28 +188,10 @@ class Searchable(object):
 
         if not cls.__searchable_columns__:
             raise Exception(
-                "No searchable columns defined for model %s" % cls.__name__
-            )
+                "No searchable columns defined for model {.__name__}".format(cls))
 
-        # We don't want sqlalchemy to know about this column so we add it
-        # externally.
-        table = cls.__table__
-        event.listen(
-            table,
-            'after_create',
-            cls._search_vector_ddl().execute_if(dialect='postgresql'),
-        )
-
-        # This indexes the tsvector column.
-        event.listen(
-            table,
-            'after_create',
-            cls._search_index_ddl().execute_if(dialect='postgresql'),
-        )
-
-        # This sets up the trigger that keeps the tsvector column up to date.
-        event.listen(
-            table,
-            'after_create',
-            cls._search_trigger_ddl().execute_if(dialect='postgresql'),
-        )
+        # add DDL list into database
+        for ddl in cls.__make_ddls():
+            event.listen(cls.__table__,
+                         'after_create',
+                         ddl)
